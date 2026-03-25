@@ -19,45 +19,69 @@ ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 DB_FILE = "sent_users.txt"
 KNOWN_CHATS_FILE = "known_chats.txt"
 
-# --- [ЛОГИКА ИИ С ОЦЕНКОЙ] ---
+# Текст подробного описания вакансии
+VACANCY_DETAILS = (
+    "Открыта удалённая позиция (без опыта) в крипто-направлении. "
+    "Суть: обработка заявок (перевод/конвертация) по пошаговой инструкции. "
+    "Обучение на старте с наставником.\n\n"
+    "💰 **Оплата:** 2000€ в месяц + 2% от объема.\n"
+    "📍 **Формат:** Удаленно, гибкий график.\n\n"
+    "Вам подходит такой формат? Рассказать, как связаться с куратором?"
+)
+
+# --- [СТРОГАЯ ЛОГИКА АНАЛИЗА] ---
 
 async def ai_evaluate_lead(text):
-    """Возвращает JSON с оценкой и решением"""
+    # 1. Технический фильтр: Вакансии обычно длинные и с кучей галочек
+    bad_icons = ['✅', '🟢', '🟩', '📍', '💰', '⏰']
+    icon_count = sum(text.count(icon) for icon in bad_icons)
+    
+    if len(text) > 100 or icon_count > 3:
+        return {"aim": False, "score": 0, "reason": "Похоже на оформленную вакансию (слишком много эмодзи или текста)"}
+
+    # 2. Запрос к ИИ
     system_prompt = (
-        "Ты — опытный рекрутер. Проанализируй сообщение соискателя. "
-        "Верни ответ СТРОГО в формате JSON: "
-        '{"aim": true/false, "score": 0-100, "reason": "кратко"}. '
-        "aim=true если человек ищет работу. score выше, если запрос четкий (город, вакансия)."
+        "Ты — эксперт-рекрутер. Твоя задача: отличить СОИСКАТЕЛЯ от РАБОТОДАТЕЛЯ. "
+        "ОТВЕТЬ aim: false, ЕСЛИ: в тексте есть условия работы, требования ('нужен опыт', 'знание языка'), "
+        "описание компании или призыв 'пишите нам'. "
+        "ОТВЕТЬ aim: true, ТОЛЬКО ЕСЛИ: человек пишет от СЕБЯ: 'Ищу работу', 'Нужна подработка', 'Хочу ворк'. "
+        "Верни JSON: {'aim': boolean, 'score': 0-100, 'reason': 'почему такое решение'}"
     )
+    
     try:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}],
             response_format={ "type": "json_object" }
         )
-        return json.loads(response.choices[0].message.content)
+        res = json.loads(response.choices[0].message.content)
+        # Если ИИ сомневается (низкий score), отсекаем
+        if res.get("score", 0) < 75:
+            res["aim"] = False
+        return res
     except:
-        return {"aim": False, "score": 0, "reason": "error"}
+        return {"aim": False, "score": 0, "reason": "Ошибка ИИ"}
 
-# --- [БАЗА ДАННЫХ] ---
+# --- [РАБОТА С БАЗОЙ СТАТУСОВ] ---
 
-def get_user_status(user_id):
+def get_status(user_id):
     if not os.path.exists(DB_FILE): return None
     with open(DB_FILE, "r") as f:
         for line in f:
-            if str(user_id) in line: return line.split(":")[-1].strip()
+            if line.startswith(f"{user_id}:"):
+                return line.split(":")[-1].strip()
     return None
 
-def update_user_status(user_id, status):
+def set_status(user_id, status):
     lines = []
-    found = False
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r") as f:
-            lines = [l for l in f.readlines() if str(user_id) not in l]
+            lines = [l for l in f.readlines() if not l.startswith(f"{user_id}:")]
     lines.append(f"{user_id}:{status}\n")
-    with open(DB_FILE, "w") as f: f.writelines(lines)
+    with open(DB_FILE, "w") as f:
+        f.writelines(lines)
 
-# --- [КЛИЕНТ] ---
+# --- [ОСНОВНОЙ КЛИЕНТ] ---
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -65,63 +89,78 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 async def handler(event):
     if not event.sender or event.sender.bot: return
 
-    # А) ОБРАБОТКА ГРУПП
+    # А) ГРУППЫ (ПОИСК ЛИДОВ)
     if event.is_group:
         if (datetime.now(timezone.utc) - event.date).total_seconds() > 60: return
         
-        # Запуск анализа ИИ
         analysis = await ai_evaluate_lead(event.raw_text)
         
-        if analysis.get("aim") and analysis.get("score", 0) > 50:
-            if get_user_status(event.sender_id) is None:
-                # Сбор данных для отчета
+        if analysis.get("aim") is True:
+            if get_status(event.sender_id) is None:
                 chat = await event.get_chat()
                 sender = event.sender
-                msg_link = f"https://t.me/c/{str(event.chat_id)[4:]}/{event.id}" if event.is_channel else f"https://t.me/{chat.username}/{event.id}" if chat.username else "no link"
                 
+                # Формируем ссылку на сообщение
+                if chat.username:
+                    msg_link = f"https://t.me/{chat.username}/{event.id}"
+                else:
+                    msg_link = f"https://t.me/c/{str(event.chat_id)[4:]}/{event.id}"
+
+                # Красивый отчет
                 report = (
-                    f"🎯 **score: {analysis['score']}%**\n"
-                    f"✅ **aim: {str(analysis['aim']).lower()}**\n"
+                    f"🎯 **score: {analysis.get('score')}%**\n"
+                    f"✅ **aim: true**\n"
                     f"----------- \n"
                     f"**question:** \n{event.raw_text} \n"
                     f"----------- \n"
-                    f"**sender_username:** @{sender.username if sender.username else 'none'}\n"
-                    f"**sender_fullName:** {sender.first_name} {sender.last_name if sender.last_name else ''}\n"
-                    f"**group:** {chat.title} ({event.chat_id})\n"
-                    f"**sender_id:** `{event.sender_id}`\n"
+                    f"**sender:** @{sender.username if sender.username else 'none'} ({sender.first_name})\n"
+                    f"**group:** {chat.title} (`{event.chat_id}`)\n"
+                    f"**reason:** {analysis.get('reason')}\n"
                     f"**message_link:** [ПЕРЕЙТИ]({msg_link})"
                 )
                 
                 await client.send_message(REPORT_CHAT_ID, report, link_preview=False)
                 
-                # Отправка в ЛС (имитация)
-                await asyncio.sleep(random.randint(20, 40))
+                # Пишем соискателю в ЛС
+                await asyncio.sleep(random.randint(30, 60))
                 try:
-                    await client.send_message(event.sender_id, "Здравствуйте! Увидела ваш запрос в группе. У нас есть удаленная вакансия в крипто-сфере, обучение с нуля. Вам было бы интересно?")
-                    update_user_status(event.sender_id, "sent")
-                except:
-                    await client.send_message(REPORT_CHAT_ID, "⚠️ ЛС закрыты, не смог написать.")
+                    await client.send_message(event.sender_id, "Здравствуйте! Увидела ваш запрос в группе. У нас сейчас открыта удаленная позиция (крипто-сфера, без опыта). Вам было бы интересно узнать детали?")
+                    set_status(event.sender_id, "sent")
+                except Exception as e:
+                    await client.send_message(REPORT_CHAT_ID, f"⚠️ Не удалось написать в ЛС `{event.sender_id}` (закрыто).")
 
-    # Б) ЛИЧКА (ВОРОНКА)
+    # Б) ЛИЧКА (ВЕДЕНИЕ ПО ВОРОНКЕ)
     elif event.is_private:
-        status = get_user_status(event.sender_id)
+        status = get_status(event.sender_id)
         if not status: return
 
+        # Шаг 1: Ответ на приветствие
         if status == "sent":
-            # Проверка интереса через простой AI-чек
-            await asyncio.sleep(5)
-            await event.reply("Суть работы: обработка заявок (удаленно). ЗП: 2000€ + 2%. Подходит?")
-            update_user_status(event.sender_id, "offered")
-        
+            # Простой ИИ чек на интерес
+            response = await ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": "Если человек проявил интерес к работе, ответь ДА."}, {"role": "user", "content": event.raw_text}]
+            )
+            if "ДА" in response.choices[0].message.content.upper():
+                await asyncio.sleep(random.randint(10, 20))
+                await event.reply(VACANCY_DETAILS)
+                set_status(event.sender_id, "offered")
+
+        # Шаг 2: Ответ на вакансию
         elif status == "offered":
-            await asyncio.sleep(5)
-            await event.reply(f"Отлично! Напишите куратору: {RECRUITER_TAG}")
-            update_user_status(event.sender_id, "final")
-            await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ДОЖАТ!** @{event.sender.username if event.sender.username else event.sender_id}")
+            response = await ai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": "Если человек согласен на работу или хочет контакты, ответь ДА."}, {"role": "user", "content": event.raw_text}]
+            )
+            if "ДА" in response.choices[0].message.content.upper():
+                await asyncio.sleep(random.randint(10, 20))
+                await event.reply(f"Отлично! Напишите нашему куратору Ханне: {RECRUITER_TAG}\nОна введет вас в курс дела!")
+                set_status(event.sender_id, "final")
+                await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ГОТОВ!** Кандидат @{event.sender.username if event.sender.username else event.sender_id} пошел к Ханне.")
 
 async def main():
     await client.start()
-    print("🤖 Бот запущен с расширенной аналитикой!")
+    print("🚀 Бот запущен! Ищу соискателей с максимальной строгостью.")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
