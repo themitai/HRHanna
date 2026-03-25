@@ -22,7 +22,7 @@ ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 # База в памяти
 user_db = {}
 
-# Жёсткий фильтр стоп-фраз (предложения работы)
+# Жёсткий фильтр стоп-фраз
 STOP_PHRASES = [
     'ищем', 'требуется', 'вакансия', 'вакансии', 'набираем', 'предлагаем работу',
     'открыта вакансия', 'компания ищет', 'мы ищем', 'зп от', 'оклад', 'в офис',
@@ -50,7 +50,7 @@ async def ai_check(text: str, task: str = "is_seeker") -> bool:
         ),
         "is_interested": (
             "Человек ответил на предложение работы и проявил интерес?\n"
-            "Ответы вроде: да, давай, интересно, расскажи, хочу, подойдёт, ок, хорошо — это ДА.\n"
+            "Ответы вроде: да, давай, интересно, расскажи, хочу, подойдёт, ок, хорошо, да интересно — это ДА.\n"
             "Отвечай ТОЛЬКО ДА или НЕТ."
         )
     }
@@ -58,8 +58,10 @@ async def ai_check(text: str, task: str = "is_seeker") -> bool:
     try:
         res = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": prompts[task]},
-                      {"role": "user", "content": text}],
+            messages=[
+                {"role": "system", "content": prompts[task]},
+                {"role": "user", "content": text}
+            ],
             max_tokens=10,
             temperature=0
         )
@@ -82,11 +84,18 @@ async def handler(event):
     user_id = event.sender_id
     text = event.raw_text.strip()
 
-    # ====================== ЛИЧНЫЕ СООБЩЕНИЯ ======================
-    if event.is_private or event.chat_id == user_id or event.to_id.user_id == user_id:
+    # ====================== 1. ЛИЧНЫЕ СООБЩЕНИЯ ======================
+    # Надёжная проверка, что сообщение пришло в личку
+    is_private = (
+        event.is_private or
+        (event.chat_id == user_id) or
+        (getattr(event, 'to_id', None) and hasattr(event.to_id, 'user_id') and event.to_id.user_id == user_id)
+    )
+
+    if is_private:
         status = user_db.get(user_id)
 
-        log.info(f"[ЛИЧКА] Сообщение от {user_id} | статус: {status} | текст: {text[:100]}")
+        log.info(f"[ЛИЧКА] Сообщение от {user_id} | статус: {status} | текст: {text[:80]}")
 
         if not status:
             log.info(f"[ЛИЧКА] Игнорируем — нет статуса для {user_id}")
@@ -118,9 +127,9 @@ async def handler(event):
                 log.info(f"[ЛИЧКА] ИИ сказал НЕТ интересу от {user_id}")
         except Exception as e:
             log.error(f"Ошибка в личке {user_id}: {e}")
-        return   # ← важно не продолжать обработку как группу
+        return  # ← выходим, не обрабатываем как группу
 
-    # ====================== ГРУППЫ ======================
+    # ====================== 2. ГРУППЫ ======================
     if not event.is_group:
         return
 
@@ -134,7 +143,7 @@ async def handler(event):
         if user_id not in user_db:
             try:
                 chat = await event.get_chat()
-                msg_link = (f"https://t.me/{chat.username}/{event.id}" if chat.username
+                msg_link = (f"https://t.me/{chat.username}/{event.id}" if getattr(chat, 'username', None)
                             else f"https://t.me/c/{str(event.chat_id)[4:]}/{event.id}")
 
                 report = (
@@ -170,7 +179,7 @@ async def handler(event):
 # ========================= ЗАПУСК =========================
 async def main():
     await client.start()
-    log.info("🚀 БОТ ЗАПУЩЕН — исправлена обработка ответов в личке")
+    log.info("🚀 БОТ ЗАПУЩЕН — исправлена обработка ответов в личке (v2)")
     await client.run_until_disconnected()
 
 
