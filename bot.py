@@ -4,6 +4,7 @@ import sqlite3
 import random
 import threading
 from datetime import datetime, timezone
+
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 from openai import AsyncOpenAI
@@ -18,27 +19,27 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SESSION_STR = os.getenv("TELEGRAM_SESSION")
 
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-DB_PATH = os.getenv("DB_PATH", "bot_data.db")
+DB_PATH = '/app/data/bot_data.db' if os.path.exists('/app/data') else 'bot_data.db'
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# --- УЛУЧШЕННЫЙ HEALTH SERVER ---
+# --- HEALTH SERVER (Для Railway) ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type', 'text/plain')
         self.end_headers()
-        self.wfile.write(b"OK") # Railway ждет любой ответ 200 OK
+        self.wfile.write(b"WORKING")
 
 def run_health_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    log(f"🌍 Health-server запущен на порту {port}")
     server.serve_forever()
 
 # --- БАЗА ДАННЫХ ---
 def init_db():
+    if os.path.dirname(DB_PATH):
+        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, status TEXT)')
     conn.close()
@@ -57,20 +58,17 @@ def set_status(user_id, status):
         conn.execute("INSERT OR REPLACE INTO users (user_id, status) VALUES (?, ?)", (user_id, status))
         conn.commit()
         conn.close()
-    except Exception as e: log(f"Ошибка БД: {e}")
+    except Exception as e: log(f"Ошибка SQLite: {e}")
 
 # --- ИИ ---
 async def ai_check(text, mode="is_seeker"):
-    log(f"🔎 ИИ ({mode}): {text[:50]}...")
+    log(f"🔎 ИИ запрос ({mode}): {text[:50]}...")
     try:
         if mode == "is_seeker":
-            sys_prompt = (
-                "Ты HR-фильтр. Отвечай ТОЛЬКО 'ДА' или 'НЕТ'. "
-                "ДА — человек САМ ищет работу (пишет: ищу работу, нужна подработка). "
-                "НЕТ — человек предлагает работу или услуги."
-            )
+            sys_prompt = "Ты HR. Ответь ДА, если человек ИЩЕТ работу. НЕТ — если предлагает или спамит."
         else:
-            sys_prompt = "Клиент заинтересован? Ответь ДА или НЕТ."
+            # Сделали промпт для ЛС более коротким и понятным
+            sys_prompt = "Это ответ клиента на предложение работы. Он заинтересован? (да, хочу, подробнее, ок). Ответь ТОЛЬКО: ДА или НЕТ."
 
         res = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -78,68 +76,74 @@ async def ai_check(text, mode="is_seeker"):
             max_tokens=5, temperature=0
         )
         ans = res.choices[0].message.content.strip().upper()
-        log(f"✅ ИИ вердикт: {ans}")
+        log(f"✅ ИИ ответ: {ans}")
         return "ДА" in ans
     except Exception as e:
         log(f"❌ Ошибка ИИ: {e}")
         return False
 
-# --- ПРОВЕРКА ПРИ ЗАПУСКЕ ---
-async def startup_check(client):
-    log("🛠 Самодиагностика...")
-    msg = "🚀 **Бот запущен и мониторит чаты!**\nТест ИИ пройден."
-    await client.send_message(REPORT_CHAT_ID, msg)
-
-# --- ОБРАБОТЧИК ---
+# --- КЛИЕНТ ---
 init_db()
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 
 @client.on(events.NewMessage)
 async def handler(event):
     if not event.sender or event.sender.bot: return
+    
     uid = event.sender_id
     text = event.raw_text.strip()
     username = f"@{event.sender.username}" if event.sender.username else f"ID: {uid}"
 
-    # ЛИЧКА
+    # 1. ОБРАБОТКА ЛИЧНЫХ СООБЩЕНИЙ (Клиент ответил нам)
     if event.is_private:
         status = get_status(uid)
+        # Если мы уже что-то писали этому человеку
         if status in ("sent", "offered"):
+            log(f"📩 Ответ в личке от {username} (статус {status}): {text}")
+            
             if await ai_check(text, "is_interest"):
                 if status == "sent":
-                    await event.reply("💼 **Условия:** Удаленно, крипто. ЗП 2000€ + %. Подходит?")
+                    await event.reply(
+                        "💼 **Условия работы:**\n"
+                        "• Удаленно (крипто-сфера)\n"
+                        "• ЗП: 2000€ + 2% бонус\n"
+                        "• Обучение 2 дня. График гибкий.\n\n"
+                        "Вам подходит такое направление?"
+                    )
                     set_status(uid, "offered")
+                    log(f"➡️ Отправили условия для {username}")
+                
                 elif status == "offered":
-                    await event.reply(f"Напишите куратору: {RECRUITER_TAG}")
+                    await event.reply(f"Супер! Для связи с командой и начала обучения напишите куратору: {RECRUITER_TAG}")
                     set_status(uid, "final")
-                    await client.send_message(REPORT_CHAT_ID, f"🔥 ЛИД ГОТОВ: {username}")
+                    await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ГОТОВ:** {username}")
+                    log(f"🎉 Лид {username} полностью готов!")
         return
 
-    # ГРУППЫ
+    # 2. ОБРАБОТКА ГРУПП (Поиск новых)
     if not event.is_group: return
     if (datetime.now(timezone.utc) - event.date).total_seconds() > 600: return
 
     if await ai_check(text, "is_seeker"):
-        # Если статуса нет — значит это новый соискатель
         if get_status(uid) is None:
             try:
                 chat = await event.get_chat()
-                log(f"🎯 Нашел соискателя: {username}")
+                log(f"🎯 Нашел соискателя в группе: {username}")
                 
-                # Отправляем отчет
+                # Отчет в твой канал
                 report = f"🎯 **НОВЫЙ ЛИД**\n👤 {username}\n🏢 {chat.title}\n📝 {text[:100]}"
                 await client.send_message(REPORT_CHAT_ID, report)
 
                 set_status(uid, "sent")
                 await asyncio.sleep(random.randint(30, 60))
-                await client.send_message(uid, "Здравствуйте! Увидела ваш запрос в группе. У нас сейчас открыта удаленная вакансия. Интересно узнать детали?")
+                await client.send_message(uid, "Здравствуйте! Увидела ваш запрос в группе. У нас сейчас открыта удаленная вакансия (крипто-направление). Вам было бы интересно узнать детали?")
             except Exception as e:
-                log(f"❌ Ошибка отправки: {e}")
+                log(f"❌ Ошибка отправки в ЛС: {e}")
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
     await client.start()
-    await startup_check(client)
+    log("🚀 БОТ ЗАПУЩЕН")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
