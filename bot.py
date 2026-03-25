@@ -5,129 +5,103 @@ from datetime import datetime, timezone
 from telethon import TelegramClient, events, types
 from openai import AsyncOpenAI
 
-# --- [БЛОК НАСТРОЕК] ---
+# --- [КОНФИГУРАЦИЯ] ---
 API_ID = 35523804          
 API_HASH = 'ff7673ebc0e925a32fb52693bdfae16f'     
 SESSION_NAME = 'hr_assistant_session'
 REPORT_CHAT_ID = 7238685565 
-RECRUITER_TAG = "@hannaober" 
+RECRUITER_TAG = "@hannaober" # Тег, куда ИИ будет отправлять людей
 
-# Берем API ключ из переменных окружения Railway
+# ИИ Ключ подтягивается из переменных Railway
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# Файлы базы
 DB_FILE = "sent_users.txt"
 KNOWN_CHATS_FILE = "known_chats.txt"
 
-# --- [ИИ ЛОГИКА] ---
+# --- [ЛОГИКА ИИ] ---
 
-async def ai_analyze_message(text, mode="check_seeker"):
-    """
-    mode "check_seeker": Ищет ли человек работу?
-    mode "check_interest": Согласен ли человек на инфо?
-    """
-    prompts = {
-        "check_seeker": "Ты — HR-фильтр. Если сообщение от человека, который ищет работу, подработку или заработок (даже со сленгом или ошибками), ответь только 'ДА'. Если это реклама, вакансия от другого или просто вопрос — 'НЕТ'.",
-        "check_interest": "Если человек проявил интерес к вакансии (сказал да, ок, пишите, что за работа, готов), ответь 'ДА'. Если отказался или спросил другое — 'НЕТ'."
-    }
-    
+async def ai_decision(text, system_prompt):
     try:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": prompts[mode]},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": text}
             ],
-            max_tokens=5,
+            max_tokens=10,
             temperature=0
         )
-        result = response.choices[0].message.content.strip().upper()
-        return "ДА" in result
+        res = response.choices[0].message.content.strip().upper()
+        return "ДА" in res
     except Exception as e:
         print(f"Ошибка ИИ: {e}")
         return False
 
 # --- [ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ] ---
 
-def is_already_sent(user_id):
+def check_user(user_id):
     if not os.path.exists(DB_FILE): return False
     with open(DB_FILE, "r") as f: return str(user_id) in f.read().splitlines()
 
-def mark_as_sent(user_id):
+def save_user(user_id):
     with open(DB_FILE, "a") as f: f.write(f"{user_id}\n")
 
-# --- [ОСНОВНАЯ ЛОГИКА] ---
+# --- [ОСНОВНОЙ КЛИЕНТ] ---
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 @client.on(events.NewMessage)
-async def group_handler(event):
-    if not event.is_group: return
+async def handler(event):
+    # 1. Если это группа - ищем соискателей
+    if event.is_group:
+        if (datetime.now(timezone.utc) - event.date).total_seconds() > 60: return
+        if not event.sender or event.sender.bot: return
 
-    # Проверка нового чата
-    if not os.path.exists(KNOWN_CHATS_FILE): open(KNOWN_CHATS_FILE, "w").close()
-    with open(KNOWN_CHATS_FILE, "r+") as f:
-        known = f.read().splitlines()
-        if str(event.chat_id) not in known:
-            chat = await event.get_chat()
-            f.write(f"{event.chat_id}\n")
-            await client.send_message(REPORT_CHAT_ID, f"✅ **ЧАТ ПОДКЛЮЧЕН:** «{chat.title}»")
+        # Логируем новую группу
+        if not os.path.exists(KNOWN_CHATS_FILE): open(KNOWN_CHATS_FILE, "w").close()
+        with open(KNOWN_CHATS_FILE, "r+") as f:
+            if str(event.chat_id) not in f.read().splitlines():
+                f.write(f"{event.chat_id}\n")
+                chat = await event.get_chat()
+                await client.send_message(REPORT_CHAT_ID, f"✅ **ГРУППА В РАБОТЕ:** {chat.title}")
 
-    # Базовые фильтры
-    if (datetime.now(timezone.utc) - event.date).total_seconds() > 60: return
-    if not event.sender or not isinstance(event.sender, types.User) or event.sender.bot: return
+        # Проверка сообщения через ИИ
+        prompt = "Ты HR. Если человек пишет, что ищет работу, подработку или нуждается в деньгах/ворке, ответь только 'ДА'. Если это спам, услуги или вакансия — 'НЕТ'."
+        if await ai_decision(event.raw_text, prompt):
+            if not check_user(event.sender_id):
+                user_link = f"tg://user?id={event.sender_id}"
+                await client.send_message(REPORT_CHAT_ID, f"🤖 **ИИ НАШЕЛ ЛИДА**\n👤: {event.sender.first_name}\n📝: _{event.raw_text}_\n👉 [ОТКРЫТЬ ЧАТ]({user_link})")
+                
+                await asyncio.sleep(random.randint(300, 600))
+                try:
+                    await client.send_message(event.sender_id, "Здравствуйте! Увидела ваше сообщение в группе. У нас есть вакансия на удаленку (крипто-сфера, без опыта). Вам было бы интересно узнать детали?")
+                    save_user(event.sender_id)
+                except:
+                    await client.send_message(REPORT_CHAT_ID, f"❌ ЛС закрыты у `{event.sender_id}`")
 
-    # ИИ Анализ
-    is_seeker = await ai_analyze_message(event.raw_text, mode="check_seeker")
-    
-    if is_seeker:
-        sender = event.sender
-        if not is_already_sent(sender.id):
-            user_link = f"tg://user?id={sender.id}"
-            chat = await event.get_chat()
-            
-            # Сообщаем в отчет
-            await client.send_message(REPORT_CHAT_ID, 
-                f"🤖 **ИИ ЗАМЕТИЛ СОИСКАТЕЛЯ**\n👤: {sender.first_name}\n📍: {chat.title}\n📝: _{event.raw_text}_\n👉 [ОТКРЫТЬ ЧАТ]({user_link})")
-            
-            # Ждем как человек
-            await asyncio.sleep(random.randint(240, 600))
-            
-            try:
-                msg = "Здравствуйте! Увидела ваше сообщение в группе. У нас сейчас есть удаленная позиция в крипто-сфере (без опыта). Вам было бы интересно узнать подробности?"
-                await client.send_message(sender.id, msg)
-                mark_as_sent(sender.id)
-            except:
-                await client.send_message(REPORT_CHAT_ID, f"❌ Закрыты ЛС у `{sender.id}`")
-
-@client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
-async def private_handler(event):
-    if not event.sender or event.sender.bot: return
-    
-    # Проверяем интерес через ИИ
-    is_interested = await ai_analyze_message(event.raw_text, mode="check_interest")
-    
-    if is_already_sent(event.sender_id) and is_interested:
-        # Имитация набора текста
-        await asyncio.sleep(random.randint(40, 90))
+    # 2. Если это личка - обрабатываем интерес
+    elif event.is_private:
+        if not event.sender or event.sender.bot: return
         
-        offer_text = (
-            f"Отлично! Суть проста: обработка входящих заявок по готовым инструкциям (обмен/конвертация). "
-            f"Обучение за наш счет, работа полностью удаленная.\n\n"
-            f"Чтобы начать или задать вопросы куратору, напишите нашему менеджеру: {RECRUITER_TAG}\n"
-            f"Скажите, что вы от Ханны."
-        )
-        
-        await event.reply(offer_text)
-        
-        # Уведомляем тебя, что лид "созрел"
-        await client.send_message(REPORT_CHAT_ID, 
-            f"🔥 **ЛИД ГОТОВ!**\nКандидат [id:{event.sender_id}](tg://user?id={event.sender_id}) ждет твоего сообщения или переходит к {RECRUITER_TAG}.")
+        prompt = "Если человек ответил согласием, проявил интерес или задал уточняющий вопрос по вакансии (да, расскажите, что за работа), ответь только 'ДА'. В остальных случаях 'НЕТ'."
+        if check_user(event.sender_id) and await ai_decision(event.raw_text, prompt):
+            await asyncio.sleep(random.randint(40, 80))
+            
+            # Текст с логичным переводом на рекрутера
+            response = (
+                f"Смотрите, работа заключается в обработке заявок (обмен/конвертация) по четким инструкциям. "
+                f"График свободный, обучение бесплатное.\n\n"
+                f"Я всего лишь помогаю с первичным отбором. Чтобы обсудить детали и начать обучение, "
+                f"напишите, пожалуйста, нашему куратору: {RECRUITER_TAG}\n"
+                f"Он сейчас на связи и введет вас в курс дела!"
+            )
+            await event.reply(response)
+            await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД СОЗРЕЛ!** Кандидат [id:{event.sender_id}](tg://user?id={event.sender_id}) отправлен к куратору.")
 
 async def main():
     await client.start()
-    print("🤖 Бот с ИИ запущен...")
+    print("🚀 Бот с ИИ OpenAI запущен и готов к работе!")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
