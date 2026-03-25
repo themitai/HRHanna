@@ -4,13 +4,15 @@ import os
 from datetime import datetime, timezone
 from telethon import TelegramClient, events, types
 from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.errors.rpcerrorlist import PeerIdInvalidError
 
 # --- [БЛОК НАСТРОЕК] ---
+# ЗАМЕНИ НА СВОИ API ДАННЫЕ С GitHub
 API_ID = 35523804          
 API_HASH = 'ff7673ebc0e925a32fb52693bdfae16f'     
 SESSION_NAME = 'hr_assistant_session'
 
-# ID чата для отчетов
+# Твой ID для отчетов
 REPORT_CHAT_ID = 7238685565 
 
 # Контакт рекрутера
@@ -19,7 +21,7 @@ RECRUITER_TAG = "@hannaober"
 # --- [ТЕКСТЫ] ---
 FIRST_QUESTION = "Здравствуйте! Увидела ваш запрос в группе по поиску работы. У нас сейчас открыта позиция в криптовалютном направлении (удаленно, без опыта). Вам прислать подробности по задачам?"
 
-# Твой основной текст (я вставил его полностью)
+# (Я использую тот же текст, что ты присылал ранее)
 DETAILED_OFFER = f"""
 Открыта удалённая позиция для кандидатов без опыта в криптовалютном направлении. В работе — обработка типовых заявок внутри процесса команды.
 
@@ -70,16 +72,12 @@ client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 @client.on(events.NewMessage)
 async def group_handler(event):
     if event.is_group:
-        # ПРОВЕРКА 1: Сообщение пришло только что (не старое)
+        # Проверка даты (не старое)
         if (datetime.now(timezone.utc) - event.date).total_seconds() > 60:
             return
 
-        # ПРОВЕРКА 2: Отправитель — человек (не канал и не группа)
-        if not event.sender or not isinstance(event.sender, types.User):
-            return
-            
-        # ПРОВЕРКА 3: Это не бот
-        if event.sender.bot:
+        # Проверка на человека и не бота
+        if not event.sender or not isinstance(event.sender, types.User) or event.sender.bot:
             return
         
         text = event.raw_text.lower()
@@ -103,33 +101,42 @@ async def group_handler(event):
                     f"👉 [ОТКРЫТЬ ЧАТ С НИМ]({user_link})"
                 )
                 
-                # Отправляем отчет тебе
                 await client.send_message(REPORT_CHAT_ID, report_msg)
                 
-                # Рандомная пауза перед отправкой оффера (имитация человека)
-                await asyncio.sleep(random.randint(60, 180))
+                # --- [ИСПРАВЛЕНИЕ: УВЕЛИЧЕННАЯ ПАУЗА] ---
+                # Ждем от 3 до 10 минут, чтобы Telegram не банил за спам.
+                wait_time = random.randint(200, 600) 
+                print(f"🎯 Нашла кандидата {sender.id}. Жду {wait_time}с для имитации человека...")
+                await asyncio.sleep(wait_time)
                 
                 try:
                     await client.send_message(sender.id, FIRST_QUESTION)
                     mark_as_sent(sender.id)
+                    print(f"✅ Оффер отправлен {sender.id}")
                 except Exception as e:
-                    await client.send_message(REPORT_CHAT_ID, f"❌ Не удалось написать в ЛС `{sender.id}` (закрыты или блок)")
+                    await client.send_message(REPORT_CHAT_ID, f"❌ Не удалось написать `{sender.id}` (ЛС закрыты)\n👉 Попробуйте [написать вручную]({user_link})")
 
 # 2. АВТООТВЕТЧИК В ЛИЧКЕ
 @client.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
 async def private_handler(event):
-    # Проверка на человека
     if not event.sender or not isinstance(event.sender, types.User) or event.sender.bot:
         return
         
     text = event.raw_text.lower()
-    positive_triggers = ['да', 'пришлите', 'интересно', 'подробности', 'расскажите', 'актуально', 'что за работа']
+    positive_triggers = ['да', 'пришлите', 'интересно', 'подробности', 'расскажите', 'актуально', 'что за работа', 'хорошо', 'давайте']
     
+    # --- [ИСПРАВЛЕНИЕ: УБРАНА ЖЕСТКАЯ ПРОВЕРКА SENDER_ID] ---
+    # Мы отвечаем всем, кто ответил "Да", при условии, что мы писали им первыми.
     if is_already_sent(event.sender_id):
         if any(word in text for word in positive_triggers):
-            await asyncio.sleep(random.randint(10, 25))
+            
+            # --- [ИСПРАВЛЕНИЕ: ПАУЗА ДЛЯ ИМИТАЦИИ ПЕЧАТИ] ---
+            # Ждем от 30 до 90 секунд перед отправкой большого текста
+            await asyncio.sleep(random.randint(30, 90))
             await event.reply(DETAILED_OFFER)
-            await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ЗАИНТЕРЕСОВАН!**\nID: `{event.sender_id}` ответил: __{event.raw_text}__")
+            
+            # Отчет тебе
+            await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ЗАИНТЕРЕСОВАН!**\nКандидат [id:{event.sender_id}](tg://user?id={event.sender_id}) ответил: __{event.raw_text}__")
 
 # --- [ФУНКЦИЯ ВСТУПЛЕНИЯ С ОТЧЕТОМ] ---
 async def join_groups():
@@ -140,9 +147,12 @@ async def join_groups():
     for group in groups:
         try:
             await client(JoinChannelRequest(group))
-            await client.send_message(REPORT_CHAT_ID, f"🌐 **ВСТУПЛЕНИЕ:** Успешно зашла в чат {group}")
+            await client.send_message(REPORT_CHAT_ID, f"🌐 **ВСТУПЛЕНИЕ:** Зашла в {group}")
+            # Пауза между группами
             await asyncio.sleep(random.randint(400, 900))
         except Exception as e:
+            # Игнорируем ошибку, если аккаунт уже состоит в группе
+            if "USER_ALREADY_PARTICIPANT" in str(e): return
             await client.send_message(REPORT_CHAT_ID, f"❌ **ОШИБКА ВСТУПЛЕНИЯ:** {group}\n{e}")
 
 async def main():
@@ -152,5 +162,10 @@ async def main():
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
+    # Fix for DeprecationWarning in Python 3.10+
+    import sys
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main())
