@@ -12,96 +12,141 @@ SESSION_NAME = 'hr_assistant_session'
 REPORT_CHAT_ID = 7238685565 
 RECRUITER_TAG = "@hannaober"
 
+# Ключ OpenAI берем из настроек Railway (Variables)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 DB_FILE = "sent_users.txt"
 KNOWN_CHATS_FILE = "known_chats.txt"
 
-client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+# Жесткие стоп-слова, чтобы отсекать работодателей без ИИ (экономия денег)
+HARD_STOP_WORDS = [
+    'требуется', 'ищем', 'вакансия', 'набираю', 'в команду', 'оплата от', 
+    'зарплата', 'ищу сотрудника', 'ищу персонал', 'лс', 'пишите в директ'
+]
 
 # --- [ЛОГИКА ИИ] ---
-async def ai_decision(text, system_prompt):
+
+async def ai_decision(text, mode="check_seeker"):
+    """
+    mode "check_seeker": Ищет ли человек работу (строго соискатель).
+    mode "check_interest": Согласен ли человек на инфо (ответ на наше ЛС).
+    """
+    if mode == "check_seeker":
+        system_msg = (
+            "Ты — фильтр соискателей. Если сообщение — это ВАКАНСИЯ или ПРЕДЛОЖЕНИЕ работы (например: 'есть место', 'платим', 'требуется', 'ищем'), ответь только 'НЕТ'. "
+            "Если человек сам ИЩЕТ работу (например: 'ищу ворк', 'нужна подработка', 'рассмотрю предложения'), ответь только 'ДА'. "
+            "Будь очень строг. Объявления о найме от HR или компаний — это всегда 'НЕТ'."
+        )
+    else:
+        system_msg = "Если человек проявил интерес к вакансии (сказал да, ок, пишите, что за работа, готов), ответь только 'ДА'. В остальных случаях 'НЕТ'."
+
     try:
         response = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": text}],
-            max_tokens=10, temperature=0
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": text}
+            ],
+            max_tokens=5,
+            temperature=0
         )
-        return "ДА" in response.choices[0].message.content.strip().upper()
-    except: return False
+        res = response.choices[0].message.content.strip().upper()
+        return "ДА" in res
+    except Exception as e:
+        print(f"Ошибка ИИ: {e}")
+        return False
 
-# --- [ГЛАВНЫЙ ОБРАБОТЧИК] ---
+# --- [ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ] ---
+
+def check_user_sent(user_id):
+    if not os.path.exists(DB_FILE): return False
+    with open(DB_FILE, "r") as f: return str(user_id) in f.read().splitlines()
+
+def save_user_sent(user_id):
+    with open(DB_FILE, "a") as f: f.write(f"{user_id}\n")
+
+# --- [ОСНОВНОЙ КЛИЕНТ] ---
+
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 @client.on(events.NewMessage)
 async def handler(event):
+    # 1. ОБРАБОТКА ГРУПП (ПОИСК)
     if event.is_group:
-        chat_id = str(event.chat_id)
-        
-        # Читаем список известных чатов
-        if os.path.exists(KNOWN_CHATS_FILE):
-            with open(KNOWN_CHATS_FILE, "r") as f:
-                known = f.read().splitlines()
-        else:
-            known = []
-
-        # Если чат новый — запоминаем и сообщаем
-        if chat_id not in known:
-            with open(KNOWN_CHATS_FILE, "a") as f:
-                f.write(f"{chat_id}\n")
-            chat = await event.get_chat()
-            # Отправляем уведомление ТОЛЬКО если это реально новый чат после старта
-            await client.send_message(REPORT_CHAT_ID, f"✅ **НОВЫЙ ЧАТ В РАБОТЕ:** {chat.title}")
-            return
-
-        # Логика поиска лидов
         if (datetime.now(timezone.utc) - event.date).total_seconds() > 60: return
         if not event.sender or event.sender.bot: return
 
-        prompt = "Ты HR. Если человек ищет работу/заработок, ответь только 'ДА'. Иначе 'НЕТ'."
-        if await ai_decision(event.raw_text, prompt):
-            # Проверка базы отправленных
-            if not os.path.exists(DB_FILE): open(DB_FILE, "w").close()
-            with open(DB_FILE, "r") as f: sent = f.read().splitlines()
-            
-            if str(event.sender_id) not in sent:
+        chat_id = str(event.chat_id)
+        
+        # Проверка нового чата
+        if not os.path.exists(KNOWN_CHATS_FILE): open(KNOWN_CHATS_FILE, "w").close()
+        with open(KNOWN_CHATS_FILE, "r+") as f:
+            known = f.read().splitlines()
+            if chat_id not in known:
+                f.write(f"{chat_id}\n")
+                chat = await event.get_chat()
+                await client.send_message(REPORT_CHAT_ID, f"✅ **НОВЫЙ ЧАТ В РАБОТЕ:** {chat.title}")
+                return
+
+        text_lower = event.raw_text.lower()
+        
+        # ПРЕДВАРИТЕЛЬНЫЙ ФИЛЬТР: если есть стоп-слова, пропускаем без ИИ
+        if any(stop in text_lower for stop in HARD_STOP_WORDS):
+            return
+
+        # ПРОВЕРКА ЧЕРЕЗ ИИ
+        if await ai_decision(event.raw_text, mode="check_seeker"):
+            if not check_user_sent(event.sender_id):
                 user_link = f"tg://user?id={event.sender_id}"
-                await client.send_message(REPORT_CHAT_ID, f"🤖 **ИИ НАШЕЛ ЛИДА**\n👤: {event.sender.first_name}\n📝: {event.raw_text[:100]}\n👉 [ОТКРЫТЬ]({user_link})")
+                chat = await event.get_chat()
                 
+                await client.send_message(REPORT_CHAT_ID, 
+                    f"🤖 **ИИ НАШЕЛ СОИСКАТЕЛЯ**\n👤: {event.sender.first_name}\n📍: {chat.title}\n📝: _{event.raw_text}_\n👉 [ОТКРЫТЬ ЧАТ]({user_link})")
+                
+                # Пауза имитации человека (5-10 минут)
                 await asyncio.sleep(random.randint(300, 600))
+                
                 try:
-                    await client.send_message(event.sender_id, "Здравствуйте! Увидела ваше сообщение в группе. У нас есть вакансия на удаленку (крипто-сфера, без опыта). Вам было бы интересно узнать детали?")
-                    with open(DB_FILE, "a") as f: f.write(f"{event.sender_id}\n")
+                    welcome_msg = "Здравствуйте! Увидела ваше сообщение в группе. У нас сейчас открыта удаленная позиция (крипто-сфера, без опыта). Вам было бы интересно узнать детали?"
+                    await client.send_message(event.sender_id, welcome_msg)
+                    save_user_sent(event.sender_id)
                 except:
                     await client.send_message(REPORT_CHAT_ID, f"❌ Закрыты ЛС у `{event.sender_id}`")
 
+    # 2. ОБРАБОТКА ЛИЧКИ (ОТВЕТЫ)
     elif event.is_private:
-        # Логика ответов в ЛС (как раньше)
         if not event.sender or event.sender.bot: return
-        if not os.path.exists(DB_FILE): return
-        with open(DB_FILE, "r") as f: sent = f.read().splitlines()
         
-        if str(event.sender_id) in sent:
-            prompt = "Если человек проявил интерес к работе, ответь только 'ДА'."
-            if await ai_decision(event.raw_text, prompt):
-                await asyncio.sleep(random.randint(40, 80))
-                await event.reply(f"Суть: обработка заявок (удаленно). Подробнее тут: {RECRUITER_TAG}")
-                await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ГОТОВ!** ID: `{event.sender_id}`")
+        # Если мы этому человеку уже писали оффер
+        if check_user_sent(event.sender_id):
+            if await ai_decision(event.raw_text, mode="check_interest"):
+                await asyncio.sleep(random.randint(40, 90))
+                
+                offer_details = (
+                    f"Смотрите, работа простая: обработка заявок (обмен/конвертация) по инструкциям. "
+                    f"Всему научим, график гибкий.\n\n"
+                    f"Я помогаю с отбором, а всеми деталями и обучением занимается куратор. "
+                    f"Напишите ему сейчас: {RECRUITER_TAG}\n"
+                    f"Он ждет вашего сообщения!"
+                )
+                await event.reply(offer_details)
+                await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ГОТОВ!** Кандидат [id:{event.sender_id}](tg://user?id={event.sender_id}) отправлен к {RECRUITER_TAG}")
 
 async def main():
     await client.start()
     
-    # ПРЕДЗАГРУЗКА: Запоминаем все текущие чаты при старте, чтобы не спамить
-    print("Инициализация чатов...")
-    current_chats = []
+    # ПРЕДЗАГРУЗКА: Записываем старые чаты в файл, чтобы не спамить при старте
+    print("Синхронизация чатов...")
+    current_ids = []
     async for dialog in client.iter_dialogs():
         if dialog.is_group:
-            current_chats.append(str(dialog.id))
+            current_ids.append(str(dialog.id))
     
     with open(KNOWN_CHATS_FILE, "w") as f:
-        f.write("\n".join(current_chats) + "\n")
+        f.write("\n".join(current_ids) + "\n")
         
-    print("🚀 Бот запущен. Текущие чаты проигнорированы, слежу за новыми.")
+    print("🚀 Бот Hanna Oberg (AI Edition) запущен!")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
