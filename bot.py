@@ -24,7 +24,7 @@ DB_PATH = '/app/data/bot_data.db' if os.path.exists('/app/data') else 'bot_data.
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-# --- HEALTH SERVER (Для Railway) ---
+# --- HEALTH SERVER ---
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -58,17 +58,16 @@ def set_status(user_id, status):
         conn.execute("INSERT OR REPLACE INTO users (user_id, status) VALUES (?, ?)", (user_id, status))
         conn.commit()
         conn.close()
-    except Exception as e: log(f"Ошибка SQLite: {e}")
+    except Exception as e: log(f"❌ Ошибка БД: {e}")
 
 # --- ИИ ---
 async def ai_check(text, mode="is_seeker"):
     log(f"🔎 ИИ запрос ({mode}): {text[:50]}...")
     try:
         if mode == "is_seeker":
-            sys_prompt = "Ты HR. Ответь ДА, если человек ИЩЕТ работу. НЕТ — если предлагает или спамит."
+            sys_prompt = "Ты HR. Ответь ДА, только если человек САМ ищет работу. НЕТ — если это вакансия или спам."
         else:
-            # Сделали промпт для ЛС более коротким и понятным
-            sys_prompt = "Это ответ клиента на предложение работы. Он заинтересован? (да, хочу, подробнее, ок). Ответь ТОЛЬКО: ДА или НЕТ."
+            sys_prompt = "Это ответ клиента. Он заинтересован? Ответь ДА или НЕТ."
 
         res = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -82,7 +81,7 @@ async def ai_check(text, mode="is_seeker"):
         log(f"❌ Ошибка ИИ: {e}")
         return False
 
-# --- КЛИЕНТ ---
+# --- ОБРАБОТЧИК ---
 init_db()
 client = TelegramClient(StringSession(SESSION_STR), API_ID, API_HASH)
 
@@ -94,33 +93,22 @@ async def handler(event):
     text = event.raw_text.strip()
     username = f"@{event.sender.username}" if event.sender.username else f"ID: {uid}"
 
-    # 1. ОБРАБОТКА ЛИЧНЫХ СООБЩЕНИЙ (Клиент ответил нам)
+    # 1. ЛИЧКА (Диалог)
     if event.is_private:
         status = get_status(uid)
-        # Если мы уже что-то писали этому человеку
         if status in ("sent", "offered"):
-            log(f"📩 Ответ в личке от {username} (статус {status}): {text}")
-            
+            log(f"📩 Ответ в ЛС от {username}: {text}")
             if await ai_check(text, "is_interest"):
                 if status == "sent":
-                    await event.reply(
-                        "💼 **Условия работы:**\n"
-                        "• Удаленно (крипто-сфера)\n"
-                        "• ЗП: 2000€ + 2% бонус\n"
-                        "• Обучение 2 дня. График гибкий.\n\n"
-                        "Вам подходит такое направление?"
-                    )
+                    await event.reply("💼 **Условия:** Удаленно, крипто. ЗП 2000€ + %. Подходит?")
                     set_status(uid, "offered")
-                    log(f"➡️ Отправили условия для {username}")
-                
                 elif status == "offered":
-                    await event.reply(f"Супер! Для связи с командой и начала обучения напишите куратору: {RECRUITER_TAG}")
+                    await event.reply(f"Напишите куратору: {RECRUITER_TAG}")
                     set_status(uid, "final")
-                    await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ГОТОВ:** {username}")
-                    log(f"🎉 Лид {username} полностью готов!")
+                    await client.send_message(REPORT_CHAT_ID, f"🔥 ЛИД ГОТОВ: {username}")
         return
 
-    # 2. ОБРАБОТКА ГРУПП (Поиск новых)
+    # 2. ГРУППЫ (Поиск)
     if not event.is_group: return
     if (datetime.now(timezone.utc) - event.date).total_seconds() > 600: return
 
@@ -128,17 +116,24 @@ async def handler(event):
         if get_status(uid) is None:
             try:
                 chat = await event.get_chat()
-                log(f"🎯 Нашел соискателя в группе: {username}")
+                log(f"🎯 Нашел лида: {username}. Готовлюсь отправить сообщение...")
                 
                 # Отчет в твой канал
                 report = f"🎯 **НОВЫЙ ЛИД**\n👤 {username}\n🏢 {chat.title}\n📝 {text[:100]}"
                 await client.send_message(REPORT_CHAT_ID, report)
 
                 set_status(uid, "sent")
-                await asyncio.sleep(random.randint(30, 60))
-                await client.send_message(uid, "Здравствуйте! Увидела ваш запрос в группе. У нас сейчас открыта удаленная вакансия (крипто-направление). Вам было бы интересно узнать детали?")
+                
+                # Короткая пауза перед отправкой
+                await asyncio.sleep(random.randint(10, 20))
+                
+                # Пытаемся отправить сообщение
+                await client.send_message(uid, "Здравствуйте! Увидела ваш запрос в группе. У нас сейчас открыта удаленная вакансия (крипто-направление). Вам интересно узнать детали?")
+                log(f"✅ УСПЕШНО НАПИСАЛИ В ЛС: {username}")
+                
             except Exception as e:
-                log(f"❌ Ошибка отправки в ЛС: {e}")
+                log(f"❌ ОШИБКА ОТПРАВКИ для {username}: {e}")
+                await client.send_message(REPORT_CHAT_ID, f"⚠️ Не удалось написать {username}. Причина: {e}")
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
