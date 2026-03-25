@@ -15,52 +15,30 @@ RECRUITER_TAG = "@hannaober"
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# СЛОВАРЬ ДЛЯ СТАТУСОВ (в памяти)
+# Храним статусы в памяти (для скорости)
 user_db = {} 
 
-# СПИСОК СТОП-ФРАЗ (КТО ПРЕДЛАГАЕТ РАБОТУ)
-STOP_PHRASES = [
-    'ищем', 'вакансия', 'в офис', 'на склад', 'требуются', 'набираем', 
-    '18-35', '18-40', 'зарплата от', 'оплата от', 'упаковке', 'сортировке',
-    'подробности в лс', 'пишите @', 'на прямую', 'официальное'
-]
+STOP_PHRASES = ['ищем', 'вакансия', 'в офис', 'на склад', 'требуются', 'набираем', 'упаковке']
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 # --- [ЛОГИКА ИИ] ---
-async def ai_is_interested(text):
+async def ai_check(text, task="is_seeker"):
+    prompts = {
+        "is_seeker": "Человек пишет 'ищу работу' или 'нужна подработка'? Ответь только ДА или НЕТ.",
+        "is_interested": "Человек хочет узнать подробности или согласен? Ответь только ДА или НЕТ."
+    }
     try:
-        response = await ai_client.chat.completions.create(
+        res = await ai_client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Если человек проявил интерес к работе (да, подробнее, ок), ответь ДА. Иначе НЕТ."},
-                {"role": "user", "content": text}
-            ],
+            messages=[{"role": "system", "content": prompts[task]}, {"role": "user", "content": text}],
             max_tokens=5
         )
-        return "ДА" in response.choices[0].message.content.upper()
-    except: return True
-
-async def ai_is_seeker(text):
-    # ПРОВЕРКА НА СТОП-СЛОВА (Чтобы не путать с вакансиями)
-    t = text.lower()
-    if any(phrase in t for phrase in STOP_PHRASES):
-        return False
-        
-    try:
-        response = await ai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты HR. Ответь ДА только если человек пишет 'Я ищу работу' или 'Нужна подработка'. Если это объявление о найме или вакансия — ответь НЕТ."},
-                {"role": "user", "content": text}
-            ],
-            max_tokens=5
-        )
-        return "ДА" in response.choices[0].message.content.upper()
+        return "ДА" in res.choices[0].message.content.upper()
     except: return False
 
-# --- [ОСНОВНОЙ КЛИЕНТ] ---
+# --- [КЛИЕНТ] ---
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 @client.on(events.NewMessage)
@@ -68,38 +46,56 @@ async def handler(event):
     if not event.sender or event.sender.bot: return
     user_id = event.sender_id
 
-    # А) ЛИЧКА (ДИАЛОГ)
+    # А) ДИАЛОГ В ЛИЧКЕ
     if event.is_private:
+        log(f"ЛС от {user_id}: {event.raw_text}")
         status = user_db.get(user_id)
-        if status == "sent":
-            if await ai_is_interested(event.raw_text):
-                await event.reply("Условия: удаленно, 2000€ + 2%, крипто-сфера. Обучение есть. Вам подходит?")
-                user_db[user_id] = "offered"
-        elif status == "offered":
-            if await ai_is_interested(event.raw_text):
-                await event.reply(f"Отлично! Напишите куратору Ханне: {RECRUITER_TAG}")
-                user_db[user_id] = "final"
-
-    # Б) ГРУППЫ (ПОИСК)
-    elif event.is_group:
-        # Проверка: сообщение свежее (не старее 2 минут)
-        if (datetime.now(timezone.utc) - event.date).total_seconds() > 120: return
         
-        if await ai_is_seeker(event.raw_text):
+        # Если бот уже что-то писал этому юзеру (любой статус кроме None)
+        if status:
+            if await ai_check(event.raw_text, "is_interested"):
+                if status == "sent":
+                    await event.reply("Условия: удаленно, крипто-сфера. ЗП: 2000€ + 2%. Обучение 2 дня. Подходит?")
+                    user_db[user_id] = "offered"
+                elif status == "offered":
+                    await event.reply(f"Супер! Напишите куратору Ханне, она даст доступ к обучению: {RECRUITER_TAG}")
+                    user_db[user_id] = "final"
+                    await client.send_message(REPORT_CHAT_ID, f"🔥 **ЛИД ДОЖАТ:** @{event.sender.username or user_id}")
+
+    # Б) ПОИСК В ГРУППАХ
+    elif event.is_group:
+        if (datetime.now(timezone.utc) - event.date).total_seconds() > 180: return
+        
+        text = event.raw_text.lower()
+        if any(p in text for p in STOP_PHRASES): return
+
+        if await ai_check(event.raw_text, "is_seeker"):
             if user_id not in user_db:
-                log(f"Нашел соискателя: {user_id}")
-                await client.send_message(REPORT_CHAT_ID, f"🔎 **ЛИД:** {event.sender.first_name}\n📝: {event.raw_text[:80]}")
+                chat = await event.get_chat()
+                msg_link = f"https://t.me/c/{str(event.chat_id)[4:]}/{event.id}" if not chat.username else f"https://t.me/{chat.username}/{event.id}"
                 
-                # Пауза перед тем как написать человеку
-                await asyncio.sleep(20)
+                # Подробный отчет в твой канал
+                report = (
+                    f"🎯 **ЛИД НАЙДЕН**\n"
+                    f"👤 **Имя:** {event.sender.first_name}\n"
+                    f"🆔 **ID:** `{user_id}`\n"
+                    f"💬 **Текст:** {event.raw_text[:100]}\n"
+                    f"📍 **Группа:** {chat.title}\n"
+                    f"🔗 **Ссылка:** [ПЕРЕЙТИ]({msg_link})"
+                )
+                await client.send_message(REPORT_CHAT_ID, report, link_preview=False)
+                
+                # Имитация набора текста и отправка в ЛС
+                user_db[user_id] = "sent"
+                await asyncio.sleep(random.randint(15, 30))
                 try:
                     await client.send_message(user_id, "Здравствуйте! Увидела ваш запрос в группе. У нас есть удаленная вакансия (крипто-сфера, без опыта). Интересно узнать детали?")
-                    user_db[user_id] = "sent"
-                except: pass
+                except:
+                    log(f"ЛС закрыты у {user_id}")
 
 async def main():
     await client.start()
-    log("🚀 БОТ ЗАПУЩЕН")
+    log("🚀 БОТ ЗАПУЩЕН И ГОТОВ")
     await client.run_until_disconnected()
 
 if __name__ == '__main__':
