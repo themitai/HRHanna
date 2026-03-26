@@ -128,18 +128,17 @@ async def handler(event):
                 chat = await event.get_chat()
                 group_name = chat.title
                 
-                # Ссылка на сообщение (валидна для публичных групп и супергрупп)
+                # Ссылка на сообщение
                 msg_id = event.id
+                chat_id = str(event.chat_id).replace("-100", "")
                 if hasattr(chat, 'username') and chat.username:
                     msg_link = f"https://t.me/{chat.username}/{msg_id}"
                 else:
-                    # Для закрытых групп ссылка через ID чата
-                    chat_id = str(event.chat_id).replace("-100", "")
                     msg_link = f"https://t.me/c/{chat_id}/{msg_id}"
 
                 log(f"🎯 Лид в {group_name}: {username}")
 
-                # Формируем отчет
+                # Формируем и отправляем отчет
                 report_text = (
                     f"🎯 **НОВЫЙ ЛИД ОБНАРУЖЕН**\n"
                     f"━━━━━━━━━━━━━━━━━━\n"
@@ -154,19 +153,25 @@ async def handler(event):
                 set_status(uid, "sent")
 
                 # Пауза перед ЛС
-                delay = random.randint(80, 200)
+                delay = random.randint(90, 210)
                 log(f"⏳ Пауза {delay} сек перед ЛС для {username}...")
                 await asyncio.sleep(delay)
 
+                # --- ИСПРАВЛЕНИЕ ТУТ ---
+                # Пытаемся "найти" пользователя заново перед отправкой
+                input_peer = await client.get_input_entity(uid)
+                
                 # Отправка случайного приветствия
-                await client.send_message(uid, random.choice(FIRST_MESSAGES))
-                log(f"✅ Сообщение отправлено к {username}")
+                await client.send_message(input_peer, random.choice(FIRST_MESSAGES))
+                log(f"✅ Сообщение успешно отправлено к {username}")
 
             except FloodWaitError as e:
                 log(f"⚠️ Ждем {e.seconds} сек (FloodWait)")
                 await asyncio.sleep(e.seconds)
+            except ValueError as e:
+                log(f"⚠️ Не удалось найти пользователя {username} после паузы: {e}")
             except Exception as e:
-                log(f"❌ Ошибка: {e}")
+                log(f"❌ Критическая ошибка: {e}")
 
 async def main():
     threading.Thread(target=run_health_server, daemon=True).start()
